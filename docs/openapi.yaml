@@ -1,0 +1,374 @@
+openapi: 3.0.3
+info:
+  title: Innovo Labs Digital Initiatives Portal API
+  version: "1.0.0"
+  description: >
+    REST API for the Innovo Labs portal. All endpoints are Next.js Route Handlers
+    under `/api/**`, running as serverless functions (Node.js runtime) on Vercel.
+
+    Authentication: session is a JWT (HS256, jose) stored in an HttpOnly cookie
+    named `innovo_session`, issued after Microsoft Entra ID (OAuth2/OIDC) SSO.
+    Because the cookie is HttpOnly it is sent automatically by the browser; there
+    is no bearer token in the Authorization header.
+
+    Authorization: enforced in two layers — the `defineRoute` wrapper (role gate +
+    Zod validation + rate limit) and PostgreSQL Row-Level Security.
+
+    Common responses (returned by the shared wrapper):
+      401 Not authenticated · 403 Forbidden · 400 validation error ·
+      429 Too Many Requests · 500 Internal server error.
+
+servers:
+  - url: https://<your-vercel-domain>
+    description: Production (Vercel)
+  - url: http://localhost:3000
+    description: Local development
+
+tags:
+  - name: Auth
+  - name: Ideas
+  - name: Initiatives
+  - name: Startups
+  - name: Content
+  - name: Social
+  - name: Admin
+  - name: Files
+
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: innovo_session
+      description: HttpOnly JWT session cookie issued after Entra ID SSO.
+  responses:
+    Unauthorized:
+      description: No valid session cookie.
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Forbidden:
+      description: Authenticated but role/permission gate failed.
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    BadRequest:
+      description: Body failed Zod validation.
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    TooManyRequests:
+      description: Per-caller rate limit exceeded.
+      headers:
+        Retry-After: { schema: { type: integer }, description: Seconds to wait. }
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    NotFound:
+      description: Resource not found.
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+  schemas:
+    Error:
+      type: object
+      properties:
+        error: { type: string }
+      required: [error]
+    Id:
+      type: string
+      format: uuid
+    User:
+      type: object
+      properties:
+        id: { $ref: '#/components/schemas/Id' }
+        email: { type: string, format: email }
+        username: { type: string }
+        name: { type: string }
+        department: { type: string, nullable: true }
+        role: { type: string, enum: [super_admin, innovation_admin, contributor, viewer] }
+    Idea:
+      type: object
+      properties:
+        id: { $ref: '#/components/schemas/Id' }
+        ideaRef: { type: string, example: IDEA-001 }
+        title: { type: string }
+        status: { type: string }
+        contributors: { type: array, items: { $ref: '#/components/schemas/User' } }
+    Initiative:
+      type: object
+      properties:
+        id: { $ref: '#/components/schemas/Id' }
+        initiativeId: { type: string, example: INIT-001 }
+        name: { type: string }
+        visibility: { type: string, nullable: true, enum: [Internal, Public, null] }
+        status: { type: string }
+        contributors: { type: array, items: { $ref: '#/components/schemas/User' } }
+    Startup:
+      type: object
+      properties:
+        id: { $ref: '#/components/schemas/Id' }
+        startupId: { type: string, example: STU-001 }
+        company: { type: string }
+        collaborationStatus: { type: string }
+        businessUnits: { type: array, items: { type: string } }
+
+security:
+  - sessionCookie: []
+
+paths:
+  # ── Auth ────────────────────────────────────────────────────────────────
+  /api/auth/sso:
+    get:
+      tags: [Auth]
+      security: []
+      summary: Begin Entra ID SSO
+      description: Generates a CSRF `state`, sets the `sso_state` cookie, redirects to Microsoft.
+      responses:
+        "302": { description: Redirect to Microsoft Entra ID authorization endpoint. }
+  /api/auth/callback/azure:
+    get:
+      tags: [Auth]
+      security: []
+      summary: SSO callback
+      description: Validates `state` against the cookie, exchanges the code, issues the session cookie.
+      parameters:
+        - { in: query, name: code, schema: { type: string }, required: true }
+        - { in: query, name: state, schema: { type: string }, required: true }
+      responses:
+        "302": { description: Redirect to the app (or /login with an error param). }
+  /api/auth/login:
+    post:
+      tags: [Auth]
+      security: []
+      summary: Programmatic login (non-SSO paths)
+      responses:
+        "200": { description: Session established. }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+  /api/auth/logout:
+    post:
+      tags: [Auth]
+      summary: Clear the session cookie
+      responses:
+        "200": { description: Cookie cleared. }
+  /api/auth/me:
+    get:
+      tags: [Auth]
+      summary: Current user profile (incl. photo)
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/User' } } } }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+    patch:
+      tags: [Auth]
+      summary: Update own profile
+      responses:
+        "200": { description: Updated. }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+
+  # ── Ideas ───────────────────────────────────────────────────────────────
+  /api/ideas:
+    get:
+      tags: [Ideas]
+      summary: List ideas (RLS-scoped to the caller)
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Idea' } } } } }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Ideas]
+      summary: Submit a new idea
+      responses:
+        "201": { description: Created. }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "429": { $ref: '#/components/responses/TooManyRequests' }
+  /api/ideas/{id}:
+    parameters: [{ in: path, name: id, required: true, schema: { $ref: '#/components/schemas/Id' } }]
+    get:
+      tags: [Ideas]
+      summary: Get one idea
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Idea' } } } }
+        "404": { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Ideas]
+      summary: Update / review an idea
+      description: Admins may edit any field; an assigned idea contributor may set status + review notes only.
+      responses:
+        "200": { description: Updated. }
+        "403": { $ref: '#/components/responses/Forbidden' }
+    delete:
+      tags: [Ideas]
+      summary: Delete an idea (admin only)
+      responses:
+        "200": { description: Deleted. }
+        "403": { $ref: '#/components/responses/Forbidden' }
+  /api/ideas/{id}/history:
+    parameters: [{ in: path, name: id, required: true, schema: { $ref: '#/components/schemas/Id' } }]
+    get:
+      tags: [Ideas]
+      summary: Idea status-change history
+      responses:
+        "200": { description: OK. }
+
+  # ── Initiatives ─────────────────────────────────────────────────────────
+  /api/initiatives:
+    get:
+      tags: [Initiatives]
+      summary: List initiatives (Internal ones hidden from out-of-scope users)
+      parameters:
+        - { in: query, name: q, schema: { type: string } }
+        - { in: query, name: status, schema: { type: string } }
+        - { in: query, name: priority, schema: { type: string } }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: object, properties: { initiatives: { type: array, items: { $ref: '#/components/schemas/Initiative' } } } } } } }
+    post:
+      tags: [Initiatives]
+      summary: Create an initiative (innovation_admin / super_admin)
+      responses:
+        "201": { description: Created. }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "429": { $ref: '#/components/responses/TooManyRequests' }
+  /api/initiatives/{id}:
+    parameters: [{ in: path, name: id, required: true, schema: { $ref: '#/components/schemas/Id' } }]
+    get:
+      tags: [Initiatives]
+      summary: Get one initiative
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Initiative' } } } }
+        "404": { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Initiatives]
+      summary: Update an initiative
+      description: Admins may edit any field; an assigned contributor may edit Framework-tab fields only.
+      responses:
+        "200": { description: Updated. }
+        "403": { $ref: '#/components/responses/Forbidden' }
+    delete:
+      tags: [Initiatives]
+      summary: Delete an initiative (admin only)
+      responses:
+        "200": { description: Deleted. }
+        "403": { $ref: '#/components/responses/Forbidden' }
+
+  # ── Startups ────────────────────────────────────────────────────────────
+  /api/startups:
+    get:
+      tags: [Startups]
+      summary: List startups (paginated)
+      parameters:
+        - { in: query, name: bu, schema: { type: string } }
+        - { in: query, name: dept, schema: { type: string } }
+        - { in: query, name: q, schema: { type: string } }
+        - { in: query, name: page, schema: { type: integer, default: 1 } }
+        - { in: query, name: limit, schema: { type: integer, default: 50, maximum: 100 } }
+      responses:
+        "200": { description: OK. }
+    post:
+      tags: [Startups]
+      summary: Create a startup (innovation_admin / super_admin)
+      responses:
+        "201": { description: Created. }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "409": { description: Duplicate company name. }
+  /api/startups/{id}:
+    parameters: [{ in: path, name: id, required: true, schema: { $ref: '#/components/schemas/Id' } }]
+    get:
+      tags: [Startups]
+      summary: Get one startup (with timeline)
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Startup' } } } }
+        "404": { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Startups]
+      summary: Update a startup
+      description: super_admin / in-scope innovation_admin edit all; contributor may edit evaluation fields only.
+      responses:
+        "200": { description: Updated. }
+        "403": { $ref: '#/components/responses/Forbidden' }
+    delete:
+      tags: [Startups]
+      summary: Delete a startup (super_admin / in-scope innovation_admin)
+      responses:
+        "200": { description: Deleted. }
+        "403": { $ref: '#/components/responses/Forbidden' }
+  /api/timeline:
+    post:
+      tags: [Startups]
+      summary: Add a startup timeline event
+      responses:
+        "201": { description: Created. }
+        "403": { $ref: '#/components/responses/Forbidden' }
+    delete:
+      tags: [Startups]
+      summary: Delete a timeline event (super_admin only)
+      responses:
+        "200": { description: Deleted. }
+        "403": { $ref: '#/components/responses/Forbidden' }
+
+  # ── Content (challenges / news / collaborations) ──────────────────────────
+  /api/challenges:
+    get: { tags: [Content], summary: List challenges, responses: { "200": { description: OK } } }
+    post: { tags: [Content], summary: Create challenge (admin), responses: { "201": { description: Created }, "403": { $ref: '#/components/responses/Forbidden' } } }
+  /api/challenges/{id}:
+    parameters: [{ in: path, name: id, required: true, schema: { $ref: '#/components/schemas/Id' } }]
+    get: { tags: [Content], summary: Get challenge, responses: { "200": { description: OK }, "404": { $ref: '#/components/responses/NotFound' } } }
+    patch: { tags: [Content], summary: Update challenge (admin), responses: { "200": { description: Updated }, "403": { $ref: '#/components/responses/Forbidden' } } }
+    delete: { tags: [Content], summary: Delete challenge (admin), responses: { "200": { description: Deleted }, "403": { $ref: '#/components/responses/Forbidden' } } }
+  /api/news:
+    get: { tags: [Content], summary: List news articles, responses: { "200": { description: OK } } }
+    post: { tags: [Content], summary: Create news (admin), responses: { "201": { description: Created }, "403": { $ref: '#/components/responses/Forbidden' } } }
+  /api/news/{id}:
+    parameters: [{ in: path, name: id, required: true, schema: { $ref: '#/components/schemas/Id' } }]
+    get: { tags: [Content], summary: Get news article, responses: { "200": { description: OK }, "404": { $ref: '#/components/responses/NotFound' } } }
+    patch: { tags: [Content], summary: Update news (admin), responses: { "200": { description: Updated }, "403": { $ref: '#/components/responses/Forbidden' } } }
+    delete: { tags: [Content], summary: Delete news (admin), responses: { "200": { description: Deleted }, "403": { $ref: '#/components/responses/Forbidden' } } }
+  /api/news/upload-video:
+    post:
+      tags: [Content]
+      summary: Upload a news video (authenticated)
+      requestBody: { content: { multipart/form-data: { schema: { type: object, properties: { file: { type: string, format: binary } } } } } }
+      responses:
+        "200": { description: Uploaded (returns URL). }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+  /api/collaborations:
+    get: { tags: [Content], summary: List collaborations, responses: { "200": { description: OK } } }
+    post: { tags: [Content], summary: Create collaboration (admin), responses: { "201": { description: Created }, "403": { $ref: '#/components/responses/Forbidden' } } }
+  /api/collaborations/{id}:
+    parameters: [{ in: path, name: id, required: true, schema: { $ref: '#/components/schemas/Id' } }]
+    get: { tags: [Content], summary: Get collaboration, responses: { "200": { description: OK }, "404": { $ref: '#/components/responses/NotFound' } } }
+    patch: { tags: [Content], summary: Update collaboration (admin), responses: { "200": { description: Updated }, "403": { $ref: '#/components/responses/Forbidden' } } }
+    delete: { tags: [Content], summary: Delete collaboration (admin), responses: { "200": { description: Deleted }, "403": { $ref: '#/components/responses/Forbidden' } } }
+
+  # ── Social (comments / ratings) ───────────────────────────────────────────
+  /api/comments:
+    get: { tags: [Social], summary: List comments for an entity, responses: { "200": { description: OK } } }
+    post: { tags: [Social], summary: Post a comment (as self), responses: { "201": { description: Created }, "400": { $ref: '#/components/responses/BadRequest' } } }
+  /api/comments/{id}:
+    parameters: [{ in: path, name: id, required: true, schema: { $ref: '#/components/schemas/Id' } }]
+    patch: { tags: [Social], summary: Edit own comment, responses: { "200": { description: Updated }, "403": { $ref: '#/components/responses/Forbidden' } } }
+    delete: { tags: [Social], summary: Delete own comment (or super_admin), responses: { "200": { description: Deleted }, "403": { $ref: '#/components/responses/Forbidden' } } }
+  /api/ratings:
+    post: { tags: [Social], summary: Create/update own rating, responses: { "200": { description: OK }, "400": { $ref: '#/components/responses/BadRequest' } } }
+
+  # ── Admin ─────────────────────────────────────────────────────────────────
+  /api/users:
+    get:
+      tags: [Admin]
+      summary: List users (super_admin only)
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/User' } } } } }
+        "403": { $ref: '#/components/responses/Forbidden' }
+  /api/users/{id}:
+    parameters: [{ in: path, name: id, required: true, schema: { $ref: '#/components/schemas/Id' } }]
+    patch:
+      tags: [Admin]
+      summary: Update a user (super_admin only)
+      responses:
+        "200": { description: Updated. }
+        "403": { $ref: '#/components/responses/Forbidden' }
+  /api/audit:
+    get: { tags: [Admin], summary: Read the audit log (admin), responses: { "200": { description: OK }, "403": { $ref: '#/components/responses/Forbidden' } } }
+    post: { tags: [Admin], summary: Write an audit entry (server-internal), responses: { "201": { description: Created } } }
+  /api/notifications:
+    get: { tags: [Admin], summary: List notifications, responses: { "200": { description: OK } } }
+    post: { tags: [Admin], summary: Create a notification, responses: { "201": { description: Created } } }
+
+  # ── Files ─────────────────────────────────────────────────────────────────
+  /api/upload:
+    post:
+      tags: [Files]
+      summary: Upload a file/image (authenticated) → returns a storage URL
+      requestBody: { content: { multipart/form-data: { schema: { type: object, properties: { file: { type: string, format: binary } } } } } }
+      responses:
+        "200": { description: Uploaded. }
+        "401": { $ref: '#/components/responses/Unauthorized' }

@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-lint:
+    name: Build & Lint & Test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/web
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: apps/web/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Security audit (production deps, fail on high)
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Lint (ESLint — includes jsx-a11y accessibility rules)
+        run: npm run lint
+
+      - name: Type check
+        run: npx tsc --noEmit
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+        env:
+          DATABASE_URL:              ${{ secrets.DATABASE_URL || 'postgresql://ci:ci@localhost/ci' }}
+          JWT_SECRET:                ${{ secrets.JWT_SECRET || 'ci-build-placeholder-min-32-chars-ok' }}
+          NEXT_PUBLIC_APP_URL:       ${{ secrets.NEXT_PUBLIC_APP_URL || 'http://localhost:3000' }}
+          NEXT_PUBLIC_SUPABASE_URL:  ${{ secrets.NEXT_PUBLIC_SUPABASE_URL || 'https://placeholder.supabase.co' }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY || 'ci-placeholder' }}
+
+  # Free / open-source secret scanning (TruffleHog OSS — no paid plan or license).
+  # --only-verified: fails only on secrets confirmed live against their provider,
+  # so it won't red-flag random high-entropy strings.
+  secret-scan:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install TruffleHog
+        run: curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sh -s -- -b /usr/local/bin
+
+      - name: Scan filesystem for committed secrets
+        run: trufflehog filesystem . --only-verified --fail --no-update

@@ -1,0 +1,31 @@
+# Keeps dependencies patched automatically so the "0 vulnerabilities" state does
+# not drift. Dependabot opens PRs for updates; CI (typecheck + test + build +
+# audit) gates them before merge.
+version: 2
+updates:
+  # npm packages for the web app
+  - package-ecosystem: "npm"
+    directory: "/apps/web"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      # Batch minor/patch bumps into one PR to reduce noise.
+      minor-and-patch:
+        update-types: ["minor", "patch"]
+    # Do NOT auto-open PRs for major upgrades. Majors can be breaking (e.g. jose,
+    # the auth library) and SSO can only be tested on production — so majors are
+    # upgraded deliberately, one at a time, not on Dependabot's schedule.
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+    labels:
+      - "dependencies"
+
+  # GitHub Actions used by the CI workflow
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
